@@ -3,9 +3,9 @@ import requests
 import csv
 
 # CONFIGURATION
-XML_PATH = r"C:\Users\nomkumar\Desktop\useful scripts\Data_excel\CS_Complete report.xml"   ## FORTIFY XML PATH
+XML_PATH = r"C:\Users\Complete report.xml"   ## FORTIFY XML PATH
 OLLAMA_API = "http://localhost:11434/api/generate"
-MODEL = "qwen2.5-coder:7b"  ## LLM MODEL NAME
+MODEL = "qwen:14b"  ## LLM MODEL NAME
 API_TIMEOUT = 180
 CSV_OUTPUT = "CS_analysis_results_Complete_Findings.csv"  ## PATH OF OUTPUT.
 
