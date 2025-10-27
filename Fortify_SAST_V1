@@ -1,0 +1,154 @@
+import xml.etree.ElementTree as ET
+import requests
+import csv
+
+# CONFIGURATION
+XML_PATH = r"C:\Users\nomkumar\Desktop\useful scripts\Data_excel\CS_Complete report.xml"   ## FORTIFY XML PATH
+OLLAMA_API = "http://localhost:11434/api/generate"
+MODEL = "qwen2.5-coder:7b"  ## LLM MODEL NAME
+API_TIMEOUT = 180
+CSV_OUTPUT = "CS_analysis_results_Complete_Findings.csv"  ## PATH OF OUTPUT.
+
+def extract_findings(xml_path):
+    findings = []
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for issue in root.findall(".//Issue"):
+            findings.append({
+                "Category": issue.findtext("Category", default="Unknown").strip(),
+                "Abstract": issue.findtext("Abstract", default="").strip(),
+                "Severity": issue.findtext("Severity", default="Unknown").strip(),
+                "FileName": issue.findtext(".//FileName", default="").strip(),
+                "FilePath": issue.findtext(".//FilePath", default="").strip(),
+                "LineStart": issue.findtext(".//LineStart", default="").strip(),
+                "Snippet": issue.findtext(".//Snippet", default="").strip(),
+                "Comments": issue.findtext(".//Comment/Comment", default="").strip(),
+                "SourceFilePath": issue.findtext(".//Source/FilePath", default="").strip(),
+                "SourceLine": issue.findtext(".//Source/Line", default="").strip(),
+                "SourceSnippet": issue.findtext(".//Source/Snippet", default="").strip(),
+                "SinkFilePath": issue.findtext(".//Sink/FilePath", default="").strip(),
+                "SinkLine": issue.findtext(".//Sink/Line", default="").strip(),
+                "SinkSnippet": issue.findtext(".//Sink/Snippet", default="").strip()
+            })
+    except Exception as e:
+        print(f"Error parsing XML: {e}")
+    return findings
+
+def build_prompt(finding):
+    return (
+        "You are a senior security engineer. For the following finding, classify it as TRUE POSITIVE (real vulnerability) or FALSE POSITIVE (safe to ignore). "
+        "Do not include confidence scores. Focus on reasoning and provide:\n"
+        "- A one-sentence summary of the finding and its impact.\n"
+        "- A brief explanation of why it is or isn't a vulnerability.\n"
+        "- A mitigation suggestion if applicable.\n"
+        "- Security impact level (e.g., High, Medium, Low).\n"
+        "- Affected user scope (e.g., Internal, External).\n"
+        "Respond ONLY in this format:\n"
+        "Classification: TRUE POSITIVE or FALSE POSITIVE\n"
+        "Reasoning: <short justification>\n"
+        "Summary: <one-sentence summary of the finding and its impact>\n"
+        "Mitigation: <suggested fix or remediation>\n"
+        "Impact Level: <e.g., High, Medium, Low>\n"
+        "User Scope: <e.g., Internal, External>\n"
+        "----\n"
+        f"Finding:\nCategory: {finding['Category']}\nAbstract: {finding['Abstract']}\n"
+        f"File: {finding['FileName']}\nPath: {finding['FilePath']}\nLine: {finding['LineStart']}\nSeverity: {finding['Severity']}\n"
+        f"Code Snippet:\n{finding['Snippet']}\nComments: {finding['Comments']}\n"
+        f"Source File Path: {finding['SourceFilePath']}\nSource Line: {finding['SourceLine']}\nSource Snippet:\n{finding['SourceSnippet']}\n"
+        f"Sink File Path: {finding['SinkFilePath']}\nSink Line: {finding['SinkLine']}\nSink Snippet:\n{finding['SinkSnippet']}\n"
+    )
+
+def query_model(prompt):
+    try:
+        response = requests.post(OLLAMA_API, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False
+        }, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        return f"Error querying model: {str(e)}"
+
+def parse_field(result, field_name):
+    for line in result.splitlines():
+        if line.startswith(f"{field_name}:"):
+            return line.replace(f"{field_name}:", "").strip()
+    return ""
+
+def main():
+    findings = extract_findings(XML_PATH)
+    if not findings:
+        print("No findings found.")
+        return
+
+    true_count = 0
+    false_count = 0
+    unclassified_count = 0
+
+    print("\n=== Vulnerability Analysis ===")
+
+    with open(CSV_OUTPUT, "w", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Index", "Category", "Abstract", "Severity", "FileName", "FilePath", "LineStart", "Snippet", "Comments",
+            "SourceFilePath", "SourceLine", "SourceSnippet",
+            "SinkFilePath", "SinkLine", "SinkSnippet",
+            "Classification", "Reasoning", "Summary", "Mitigation", "Impact Level", "User Scope"
+        ])
+
+        for idx, finding in enumerate(findings, 1):
+            prompt = build_prompt(finding)
+            result = query_model(prompt)
+            classification = parse_field(result, "Classification")
+            reasoning = parse_field(result, "Reasoning")
+            summary = parse_field(result, "Summary")
+            mitigation = parse_field(result, "Mitigation")
+            impact_level = parse_field(result, "Impact Level")
+            user_scope = parse_field(result, "User Scope")
+
+            print(f"\nFinding {idx}: {finding['Category']} | {finding['FileName']}:{finding['LineStart']}")
+            print(result)
+            print("-" * 80)
+
+            if classification == "TRUE POSITIVE":
+                true_count += 1
+            elif classification == "FALSE POSITIVE":
+                false_count += 1
+            else:
+                unclassified_count += 1
+
+            writer.writerow([
+                idx,
+                finding["Category"],
+                finding["Abstract"],
+                finding["Severity"],
+                finding["FileName"],
+                finding["FilePath"],
+                finding["LineStart"],
+                finding["Snippet"],
+                finding["Comments"],
+                finding["SourceFilePath"],
+                finding["SourceLine"],
+                finding["SourceSnippet"],
+                finding["SinkFilePath"],
+                finding["SinkLine"],
+                finding["SinkSnippet"],
+                classification,
+                reasoning,
+                summary,
+                mitigation,
+                impact_level,
+                user_scope
+            ])
+
+    print("\n=== Summary ===")
+    print(f"Total Findings: {len(findings)}")
+    print(f"TRUE POSITIVE: {true_count}")
+    print(f"FALSE POSITIVE: {false_count}")
+    print(f"Unclassified/Error: {unclassified_count}")
+    print(f"Results saved to: {CSV_OUTPUT}")
+
+if __name__ == "__main__":
+    main()
