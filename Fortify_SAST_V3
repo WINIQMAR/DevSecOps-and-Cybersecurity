@@ -1,0 +1,104 @@
+import xml.etree.ElementTree as ET
+import requests
+import csv
+
+# CONFIGURATION
+XML_PATH = r"C:\Users\test.xml"
+OLLAMA_API = "http://localhost:11434/api/generate"
+MODEL = "qwen:14b"
+API_TIMEOUT = 180
+CSV_OUTPUT = "test.csv"
+
+# STEP 1: Extract findings from XML
+def extract_findings(xml_path):
+    findings = []
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for issue in root.findall(".//Issue"):
+            findings.append({
+                "Category": issue.findtext("Category", default="Unknown").strip(),
+                "Abstract": issue.findtext("Abstract", default="").strip(),
+                "Severity": issue.findtext("Severity", default="Unknown").strip(),
+                "Source_Snippet": issue.findtext(".//Source_Snippet", default="").strip(),
+                "Sink_Snippet": issue.findtext(".//Sink_Snippet", default="").strip()
+            })
+    except Exception as e:
+        print(f"Error parsing XML: {e}")
+    return findings
+# STEP 2: Build prompt for AI model
+def build_prompt(finding):
+    return (
+        "You are a senior security engineer reviewing static analysis findings. Your task is to classify each finding as either TRUE POSITIVE (a real vulnerability) or FALSE POSITIVE (safe or irrelevant). "
+        "Perform deep analysis of the Source_Snippet and Sink_Snippet fields. Do not make assumptions. Use your expertise to identify false positive patterns such as safe use of variables, known benign libraries, or contextually harmless code. "
+        "Respond ONLY in this format:\n"
+        "Classification: TRUE POSITIVE or FALSE POSITIVE\n"
+        "Reasoning: <short but valid justification based on deep analysis of Source_Snippet and Sink_Snippet>\n"
+        "----\n"
+        f"Finding:\nCategory: {finding['Category']}\nAbstract: {finding['Abstract']}\n"
+        f"Severity: {finding['Severity']}\n"
+        f"Source Snippet:\n{finding['Source_Snippet']}\nSink Snippet:\n{finding['Sink_Snippet']}\n"
+    )
+
+# STEP 3: Send prompt to AI model
+def query_model(prompt):
+    try:
+        response = requests.post(OLLAMA_API, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False
+        }, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        return f"Error querying model: {str(e)}"
+
+# STEP 4: Parse AI response
+def parse_field(result, field_name):
+    for line in result.splitlines():
+        if line.startswith(f"{field_name}:"):
+            return line.replace(f"{field_name}:", "").strip()
+    return ""
+
+# STEP 5: Main logic
+def main():
+    findings = extract_findings(XML_PATH)
+    total_findings = len(findings)
+    if total_findings == 0:
+        print("No findings found.")
+        return
+
+    with open(CSV_OUTPUT, "w", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Index", "Category", "Abstract", "Severity",
+            "Source_Snippet", "Sink_Snippet", "Classification", "Reasoning"
+        ])
+
+        for idx, finding in enumerate(findings, 1):
+            print(f"Processing finding {idx}/{total_findings} ({(idx/total_findings)*100:.2f}%)")
+            prompt = build_prompt(finding)
+            result = query_model(prompt)
+            classification = parse_field(result, "Classification")
+            reasoning = parse_field(result, "Reasoning")
+
+            if classification == "FALSE POSITIVE":
+                print(f"\nFinding {idx}: {finding['Category']}")
+                print(result)
+                print("-" * 80)
+
+                writer.writerow([
+                    idx,
+                    finding["Category"],
+                    finding["Abstract"],
+                    finding["Severity"],
+                    finding["Source_Snippet"],
+                    finding["Sink_Snippet"],
+                    classification,
+                    reasoning
+                ])
+
+    print(f"\nFiltered results saved to: {CSV_OUTPUT}")
+
+if __name__ == "__main__":
+    main()
