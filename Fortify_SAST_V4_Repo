@@ -1,0 +1,610 @@
+import os
+import re
+import csv
+import glob
+import json
+import time
+import math
+import difflib
+import requests
+import xml.etree.ElementTree as ET
+from collections import Counter
+from typing import List, Tuple, Dict, Any, Optional
+
+# Optional but recommended: robust retry adapter for transient network errors
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    HAVE_RETRY = True
+except Exception:
+    HAVE_RETRY = False
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+XML_PATH   = r"C:\Users\test.xml"
+REPO_ROOT  = r"C:\Users\vinay"
+
+# Model / Ollama
+OLLAMA_API   = "http://127.0.0.1:11434/api/generate"  # 127.0.0.1 avoids IPv6 issues on Windows/WSL
+MODEL        = "qwen:14b"
+TIMEOUT_SEC  = 600                 # read timeout; streaming keeps bytes flowing
+TEMPERATURE  = 0.0                 # deterministic to avoid variance
+SEED         = 42                  # reproducible outputs
+NUM_PREDICT  = 160                 # small JSON; keep tight to avoid drift
+KEEP_ALIVE   = "24h"               # keep model warm between calls
+
+# CSV output
+CSV_OUTPUT       = "fortify_triage_dynamic.csv"
+RESUME_FROM_INDEX = 1              # 1-based index to resume a partial run
+
+# FP precision policy
+FP_CONF_THRESH = 0.80              # write ONLY FP with conf >= this threshold
+
+# Prompt sizing (small by design; enlarge only when needed)
+CTX_BEFORE       = 10              # ~20–40 lines total context window
+CTX_AFTER        = 10
+MAX_CTX_CHARS    = 800
+EVIDENCE_MAX     = 2               # few short supporting snippets
+EVIDENCE_CTX     = 1               # +/- lines around each evidence hit
+EVIDENCE_MAX_LEN = 220
+
+# Retry / Backoff
+MAX_RETRIES        = 2             # per attempt (total attempts = 1 + MAX_RETRIES)
+INITIAL_BACKOFF_S  = 4
+BACKOFF_MULTIPLIER = 2.0
+
+# =========================
+# HELPERS: XML
+# =========================
+def parse_xml(xml_path: str) -> List[Dict[str, Any]]:
+    findings = []
+    try:
+        root = ET.parse(xml_path).getroot()
+        issues = list(root.findall(".//Issue"))
+        if not issues:
+            # Fallback for vendor-specific namespaces
+            issues = [n for n in root.iter() if n.tag.split('}')[-1].lower() == "issue"]
+
+        for issue in issues:
+            def get(tag):
+                node = issue.find(tag)
+                if node is not None and node.text:
+                    return node.text.strip()
+                for e in issue.iter():
+                    if e.tag.split('}')[-1] == tag:
+                        return (e.text or "").strip()
+                return ""
+
+            f = {
+                "Category": get("Category") or "Unknown",
+                "Abstract": get("Abstract") or "",
+                "Severity": get("Severity") or "Unknown",
+                "FileName": get("FileName") or "",
+                "FilePath": get("FilePath") or "",
+                "Snippet":  get("Snippet")  or ""
+            }
+            for k in ["Line","StartLine","LineStart","PrimaryLine","SinkLine","SourceLine"]:
+                v = get(k)
+                if v and v.isdigit():
+                    f[k] = int(v)
+            findings.append(f)
+    except Exception as e:
+        print("[ERROR] XML parse failed:", e)
+    return findings
+
+# =========================
+# HELPERS: PATH & CONTEXT
+# =========================
+def norm_path(p: str) -> str:
+    if not p:
+        return ""
+    return os.path.normpath(p.replace("\\", os.sep).replace("/", os.sep))
+
+def guess_repo_join(xml_path: str) -> str:
+    if not xml_path:
+        return ""
+    toks = norm_path(xml_path).split(os.sep)
+    for root_token in ("src", "app", "lib", "server", "client"):
+        if root_token in toks:
+            tail = os.path.join(*toks[toks.index(root_token):])
+            return os.path.join(REPO_ROOT, tail)
+    return os.path.join(REPO_ROOT, os.path.basename(xml_path))
+
+def resolve_file(file_path: str, file_name: str, snippet: str) -> str:
+    p = norm_path(file_path)
+    if p and os.path.isabs(p) and os.path.isfile(p):
+        return p
+    g = guess_repo_join(p)
+    if g and os.path.isfile(g):
+        return g
+    if file_name:
+        matches = glob.glob(os.path.join(REPO_ROOT, "**", os.path.basename(file_name)), recursive=True)
+        if snippet:
+            s = snippet.strip()
+            for fp in matches:
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        if s and s in f.read():
+                            return fp
+                except Exception:
+                    pass
+        if matches:
+            return matches[0]
+    return ""
+
+def anchor_index(lines: List[str], finding: Dict[str, Any]) -> Optional[int]:
+    # Prefer explicit line info from the scanner:
+    for k in ["Line","StartLine","LineStart","PrimaryLine","SinkLine","SourceLine"]:
+        if k in finding and isinstance(finding[k], int):
+            idx = max(0, min(len(lines)-1, finding[k]-1))
+            return idx
+    # Otherwise try snippet search:
+    snip = (finding.get("Snippet") or "")
+    parts = [s.strip() for s in snip.splitlines() if s.strip()]
+    for needle in parts[:3]:
+        for i, ln in enumerate(lines):
+            if needle and needle in ln:
+                return i
+    # Fuzzy match on first non-empty snippet line:
+    try:
+        sample = parts[0] if parts else ""
+        if sample:
+            stripped = [ln.strip() for ln in lines]
+            best = difflib.get_close_matches(sample, stripped, n=1, cutoff=0.85)
+            if best:
+                return stripped.index(best[0])
+    except Exception:
+        pass
+    return None
+
+def slice_context(lines: List[str], center_idx: Optional[int], before: int, after: int, max_chars: int) -> str:
+    if not lines:
+        return ""
+    if center_idx is None:
+        txt = "".join(lines[:min(len(lines), before+after)])
+    else:
+        s = max(0, center_idx - before)
+        e = min(len(lines), center_idx + after)
+        txt = "".join(lines[s:e])
+    return txt[:max_chars]
+
+# =========================
+# DYNAMIC EVIDENCE (no hardcoded category patterns)
+# =========================
+IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
+
+def tokenize(s: str) -> List[str]:
+    return [t.lower() for t in re.findall(r"[A-Za-z0-9_]{2,}", s or "")]
+
+def extract_identifiers(snippet: str) -> List[str]:
+    if not snippet:
+        return []
+    ids = set(IDENT_RE.findall(snippet))
+    return list(ids)[:12]
+
+def jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+def evidence_from_file_dynamic(lines: List[str],
+                               finding: Dict[str, Any],
+                               exclude_range: Tuple[Optional[int], Optional[int]],
+                               max_hits: int, ctx: int, max_len: int) -> List[Dict[str, Any]]:
+    """
+    Purely dynamic evidence selection:
+      - No category/pattern keywords
+      - Scores candidate lines by:
+        * lexical similarity (Jaccard on tokens vs snippet)
+        * identifier overlap (from the snippet)
+      - Picks top distinct spans around best lines
+    """
+    if not lines or max_hits <= 0:
+        return []
+
+    snippet = finding.get("Snippet", "") or ""
+    snip_tokens = tokenize(snippet)
+    ids = set(extract_identifiers(snippet))
+
+    s_ex, e_ex = exclude_range
+    scored: List[Tuple[float, int]] = []  # (score, line_index)
+    for i, ln in enumerate(lines):
+        if s_ex is not None and e_ex is not None and s_ex <= i <= e_ex:
+            continue
+        ltoks = tokenize(ln)
+        if not ltoks:
+            continue
+        sim = jaccard(snip_tokens, ltoks)
+        id_overlap = len(ids & set(re.findall(IDENT_RE, ln))) if ids else 0
+        # Generic, content-agnostic scoring (weights chosen empirically)
+        score = (0.65 * sim) + (0.35 * (id_overlap > 0))
+        if score > 0.0:
+            scored.append((score, i))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    hits = []
+    seen_spans = set()
+    for _, i in scored:
+        s = max(0, i - ctx)
+        e = min(len(lines), i + ctx + 1)
+        span = (s, e)
+        if span in seen_spans:
+            continue
+        seen_spans.add(span)
+        snippet_text = "".join(lines[s:e])[:max_len]
+        hits.append({"line": i+1, "snippet": snippet_text})
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+# =========================
+# MODEL PROMPT
+# =========================
+SYSTEM_TEXT = (
+    "You are a senior application security triager. "
+    "Decide ONLY based on the given code context and short evidence. "
+    "Return EXACTLY one JSON object with keys: classification (TRUE_POSITIVE, FALSE_POSITIVE, NEEDS_REVIEW), "
+    "confidence (0.0-1.0), reason (short). "
+    "Label FALSE_POSITIVE only when the provided context clearly indicates the reported issue is not exploitable in practice "
+    "(e.g., non-production/test/migration/example data, commented-out or dead code, placeholders, or the issue is clearly mitigated nearby). "
+    "If you cannot show this from the context alone, prefer NEEDS_REVIEW over FALSE_POSITIVE."
+)
+
+def build_prompt(finding: Dict[str,Any], local_ctx: str, evidence: List[Dict[str,Any]],
+                 ctx_before: int, ctx_after: int) -> str:
+    ev_text = "\n\n".join([f"[line {e['line']}]\n{e['snippet']}" for e in evidence]) or "None"
+    return (
+        f"{SYSTEM_TEXT}\n\n"
+        f"Finding:\n"
+        f"- Category: {finding.get('Category','')}\n"
+        f"- Abstract: {finding.get('Abstract','')}\n"
+        f"- Severity: {finding.get('Severity','')}\n"
+        f"- File: {finding.get('FileName','')}\n"
+        f"- Path: {finding.get('FilePath','')}\n\n"
+        f"Local code context (±{ctx_before}-{ctx_after} lines, trimmed):\n{local_ctx}\n\n"
+        f"Additional evidence (short spans from elsewhere in file):\n{ev_text}\n\n"
+        f"Respond with a single JSON object only."
+    )
+
+def extract_json_payload(text: str) -> Dict[str, Any]:
+    s = text.find("{")
+    e = text.rfind("}")
+    if s != -1 and e != -1 and e > s:
+        try:
+            return json.loads(text[s:e+1])
+        except Exception:
+            return {}
+    return {}
+
+# =========================
+# OLLAMA SESSION & CALLS
+# =========================
+def make_session() -> requests.Session:
+    session = requests.Session()
+    if HAVE_RETRY:
+        adapter = HTTPAdapter(max_retries=Retry(
+            total=2,
+            connect=2,
+            read=0,                 # streaming keeps read alive
+            backoff_factor=0.3,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        ))
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
+
+def ping_ollama(session: requests.Session) -> bool:
+    try:
+        payload = {
+            "model": MODEL,
+            "prompt": "{}",
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.0, "num_predict": 16, "num_ctx": 512, "seed": SEED},
+            "keep_alive": KEEP_ALIVE
+        }
+        r = session.post(OLLAMA_API, json=payload, timeout=(10, 60))
+        r.raise_for_status()
+        _ = r.json().get("response", "")
+        return True
+    except Exception as e:
+        print("[ERROR] Ollama health check failed:", e)
+        return False
+
+def generate_streaming(session: requests.Session, prompt: str,
+                       timeout_tuple=(15, TIMEOUT_SEC),
+                       temp: float = TEMPERATURE,
+                       num_predict: int = NUM_PREDICT) -> str:
+    """
+    Calls Ollama with stream=True and accumulates 'response' fragments until done.
+    Returns the full response text.
+    """
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": True,
+        "format": "json",  # ask model to emit strict JSON
+        "options": {
+            "temperature": temp,
+            "seed": SEED,
+            "num_predict": num_predict,
+            "num_ctx": 2048
+        },
+        "keep_alive": KEEP_ALIVE
+    }
+
+    with session.post(OLLAMA_API, json=payload, stream=True, timeout=timeout_tuple) as r:
+        r.raise_for_status()
+        chunks = []
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            # Each line should be a JSON object from Ollama
+            try:
+                data = json.loads(line)
+                chunks.append(data.get("response", ""))
+                if data.get("done"):
+                    break
+            except json.JSONDecodeError:
+                # Conservative: ignore noisy fragments
+                continue
+        return "".join(chunks)
+
+def query_json_with_retries(session: requests.Session, prompt: str, timeout_sec: int,
+                            attempts: int, backoff_s: float, temp: float) -> Dict[str, Any]:
+    """
+    Prefer streaming to avoid read timeouts; fallback to non-streaming once.
+    Deterministic (temp=0, seed fixed).
+    """
+    last_err = None
+    # 1) Streaming attempts
+    for attempt in range(attempts):
+        try:
+            resp_text = generate_streaming(
+                session,
+                prompt,
+                timeout_tuple=(15, timeout_sec),
+                temp=temp,
+                num_predict=NUM_PREDICT
+            )
+            try:
+                return json.loads(resp_text)
+            except Exception:
+                extracted = extract_json_payload(resp_text)
+                if extracted:
+                    return extracted
+                return {"classification": "NEEDS_REVIEW", "confidence": 0.0, "reason": "Unparseable response"}
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+        time.sleep(backoff_s * (BACKOFF_MULTIPLIER ** attempt))
+
+    # 2) Fallback once to non-streaming
+    try:
+        payload = {
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": temp, "seed": SEED, "num_predict": NUM_PREDICT, "num_ctx": 2048},
+            "keep_alive": KEEP_ALIVE
+        }
+        r = session.post(OLLAMA_API, json=payload, timeout=(15, timeout_sec))
+        r.raise_for_status()
+        data = r.json()
+        resp_text = (data.get("response") or "").strip()
+        try:
+            return json.loads(resp_text)
+        except Exception:
+            extracted = extract_json_payload(resp_text)
+            if extracted:
+                return extracted
+            return {"classification":"NEEDS_REVIEW","confidence":0.0,"reason":"Unparseable response"}
+    except Exception as e:
+        last_err = e
+
+    return {"classification": "NEEDS_REVIEW", "confidence": 0.0, "reason": f"Model error: {last_err}"}
+
+# =========================
+# DECISION & NORMALIZATION
+# =========================
+def norm_label(lbl: str) -> str:
+    s = (lbl or "").strip().upper()
+    if "FALSE" in s: return "FALSE_POSITIVE"
+    if "TRUE"  in s: return "TRUE_POSITIVE"
+    if "REVIEW" in s or "UNKNOWN" in s: return "NEEDS_REVIEW"
+    return "NEEDS_REVIEW"
+
+def norm_confidence(x: Any) -> float:
+    """
+    Normalize confidence to [0,1]. Accepts 0–1 or percentage-like values.
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if v > 1.0:
+        v = v / 100.0  # treat as percent
+    return max(0.0, min(1.0, v))
+
+def decide_single(session: requests.Session,
+                  finding: Dict[str,Any],
+                  local_ctx: str,
+                  evidence: List[Dict[str,Any]],
+                  limits: Dict[str,int],
+                  temperature: float,
+                  timeout_sec: int) -> Dict[str, Any]:
+    prompt = build_prompt(finding, local_ctx, evidence, limits["CTX_BEFORE"], limits["CTX_AFTER"])
+    out = query_json_with_retries(session, prompt, timeout_sec, attempts=1+MAX_RETRIES,
+                                  backoff_s=INITIAL_BACKOFF_S, temp=temperature)
+    cls = norm_label(out.get("classification"))
+    conf = norm_confidence(out.get("confidence", 0))
+    reason = str(out.get("reason","")).strip()[:240]
+    return {"final": cls, "confidence": conf, "reason": reason}
+
+# =========================
+# ADAPTIVE LIMITS (shrink on heavy cases)
+# =========================
+def make_base_limits() -> Dict[str,int]:
+    return {
+        "CTX_BEFORE": CTX_BEFORE,
+        "CTX_AFTER":  CTX_AFTER,
+        "MAX_CTX_CHARS": MAX_CTX_CHARS,
+        "EVIDENCE_MAX":  EVIDENCE_MAX,
+        "EVIDENCE_CTX":  EVIDENCE_CTX,
+        "EVIDENCE_MAX_LEN": EVIDENCE_MAX_LEN
+    }
+
+def shrink_limits_once(limits: Dict[str,int]) -> Dict[str,int]:
+    # Halve context & chars; evidence -> 1
+    limits["CTX_BEFORE"] = max(5, math.ceil(limits["CTX_BEFORE"] / 2))
+    limits["CTX_AFTER"]  = max(5, math.ceil(limits["CTX_AFTER"]  / 2))
+    limits["MAX_CTX_CHARS"] = max(500, math.ceil(limits["MAX_CTX_CHARS"] * 0.7))
+    limits["EVIDENCE_MAX"] = min(1, limits["EVIDENCE_MAX"])
+    limits["EVIDENCE_CTX"] = 1
+    limits["EVIDENCE_MAX_LEN"] = max(160, limits["EVIDENCE_MAX_LEN"])
+    return limits
+
+def shrink_limits_more(limits: Dict[str,int]) -> Dict[str,int]:
+    # Very small ctx, no evidence
+    limits["CTX_BEFORE"] = min(limits["CTX_BEFORE"], 5)
+    limits["CTX_AFTER"]  = min(limits["CTX_AFTER"], 5)
+    limits["MAX_CTX_CHARS"] = min(limits["MAX_CTX_CHARS"], 500)
+    limits["EVIDENCE_MAX"] = 0
+    limits["EVIDENCE_CTX"] = 0
+    limits["EVIDENCE_MAX_LEN"] = 150
+    return limits
+
+# =========================
+# MAIN
+# =========================
+def main():
+    findings = parse_xml(XML_PATH)
+    if not findings:
+        print("[INFO] No findings in XML.")
+        return
+
+    session = make_session()
+
+    # Health check Ollama first (also warms and keeps model loaded)
+    print("[INFO] Pinging Ollama...")
+    if not ping_ollama(session):
+        print("[ABORT] Ollama is not responding. Please ensure the model is loaded and try again.")
+        return
+
+    os.makedirs(os.path.dirname(os.path.abspath(CSV_OUTPUT)) or ".", exist_ok=True)
+
+    # Open CSV and write header if file doesn't exist or empty
+    write_header = (not os.path.exists(CSV_OUTPUT)) or (os.path.getsize(CSV_OUTPUT) == 0)
+    f = open(CSV_OUTPUT, "a", newline="", encoding="utf-8")
+    w = csv.writer(f)
+    if write_header:
+        w.writerow([
+            "Index","Category","Abstract","Severity",
+            "FileName","FilePath","ResolvedPath","AnchorLine",
+            "Snippet","LocalContext","EvidenceSummary",
+            "Final","Confidence","Reason"
+        ])
+        f.flush()
+
+    total = len(findings)
+    start_idx = max(1, RESUME_FROM_INDEX)
+
+    for i, fd in enumerate(findings, 1):
+        if i < start_idx:
+            continue
+
+        print(f"[+] {i}/{total}  {fd.get('Category','')}")
+        resolved = resolve_file(fd.get("FilePath",""), fd.get("FileName",""), fd.get("Snippet",""))
+
+        lines = []
+        if resolved and os.path.isfile(resolved):
+            try:
+                with open(resolved, "r", encoding="utf-8", errors="ignore") as rf:
+                    lines = rf.readlines()
+            except Exception as e:
+                print(f"[WARN] Could not read file: {resolved} ({e})")
+
+        # Build per-finding limits (will shrink if needed)
+        limits = make_base_limits()
+
+        # Determine anchor & local context (respect current limits)
+        center = anchor_index(lines, fd) if lines else None
+        local_ctx = slice_context(
+            lines, center,
+            before=limits["CTX_BEFORE"],
+            after=limits["CTX_AFTER"],
+            max_chars=limits["MAX_CTX_CHARS"]
+        ) if lines else (fd.get("Snippet","")[:limits["MAX_CTX_CHARS"]])
+
+        # Evidence (purely dynamic, exclude local ctx range)
+        if lines:
+            if center is None:
+                exclude = (None, None)
+            else:
+                s_ex = max(0, center - limits["CTX_BEFORE"])
+                e_ex = min(len(lines)-1, center + limits["CTX_AFTER"])
+                exclude = (s_ex, e_ex)
+            evidence = evidence_from_file_dynamic(
+                lines=lines,
+                finding=fd,
+                exclude_range=exclude,
+                max_hits=limits["EVIDENCE_MAX"],
+                ctx=limits["EVIDENCE_CTX"],
+                max_len=limits["EVIDENCE_MAX_LEN"]
+            )
+        else:
+            evidence = []
+
+        # Single deterministic decision (no multi-pass -> less variance)
+        result = decide_single(session, fd, local_ctx, evidence, limits, TEMPERATURE, TIMEOUT_SEC)
+
+        # If model encountered a hard error and returned NEEDS_REVIEW, try shrinking context once or twice
+        if result["final"] == "NEEDS_REVIEW" and ("Model error" in result["reason"] or "Unparseable" in result["reason"]):
+            print("[INFO] Model error/parse issue. Shrinking prompt and retrying deterministically...")
+            limits = shrink_limits_once(limits)
+            local_ctx = slice_context(lines, center, limits["CTX_BEFORE"], limits["CTX_AFTER"], limits["MAX_CTX_CHARS"]) if lines else (fd.get("Snippet","")[:limits["MAX_CTX_CHARS"]])
+            evidence = evidence_from_file_dynamic(lines, fd, (None,None), limits["EVIDENCE_MAX"], limits["EVIDENCE_CTX"], limits["EVIDENCE_MAX_LEN"]) if lines else []
+            result = decide_single(session, fd, local_ctx, evidence, limits, TEMPERATURE, TIMEOUT_SEC)
+
+            if result["final"] == "NEEDS_REVIEW" and ("Model error" in result["reason"] or "Unparseable" in result["reason"]):
+                print("[INFO] Still failing. Minimal prompt retry...")
+                limits = shrink_limits_more(limits)
+                local_ctx = slice_context(lines, center, limits["CTX_BEFORE"], limits["CTX_AFTER"], limits["MAX_CTX_CHARS"]) if lines else (fd.get("Snippet","")[:limits["MAX_CTX_CHARS"]])
+                evidence = []  # no evidence for minimal prompt
+                result = decide_single(session, fd, local_ctx, evidence, limits, TEMPERATURE, TIMEOUT_SEC)
+
+        # --- FP gating policy: ONLY write high-confidence FP rows ---
+        is_fp = (result["final"] == "FALSE_POSITIVE")
+        high_conf = (result["confidence"] >= FP_CONF_THRESH)
+
+        if is_fp and high_conf:
+            ev_summ = "|".join([f"@{e['line']}" for e in evidence]) if evidence else ""
+            w.writerow([
+                i,
+                fd.get("Category",""), fd.get("Abstract",""), fd.get("Severity",""),
+                fd.get("FileName",""),  fd.get("FilePath",""), resolved or "", (center+1) if center is not None else "",
+                (fd.get("Snippet","")[:500]),
+                local_ctx[:700],
+                ev_summ,
+                result["final"], round(result["confidence"],3), result["reason"]
+            ])
+            f.flush()  # persist progress
+        else:
+            # Skip non-FP or low-confidence FP (do not write to CSV)
+            pass
+
+    f.close()
+    print(f"[DONE] CSV (FP-only, high-confidence) saved: {os.path.abspath(CSV_OUTPUT)}")
+
+if __name__ == "__main__":
+    main()
