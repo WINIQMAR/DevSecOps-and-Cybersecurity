@@ -1,0 +1,117 @@
+import xml.etree.ElementTree as ET
+import requests
+import csv
+
+# CONFIGURATION
+XML_PATH = r"C:\Users\nomkumar\Desktop\XML\Edited\REMOVED DATA FOR XML\AHCT_R47_Cycle1_Edited_Medium_High_REMOVED_STATUS_COMMENTS.xml"
+OLLAMA_API = "http://localhost:11434/api/generate"
+MODEL = "qwen:14b"
+API_TIMEOUT = 180
+CSV_OUTPUT = "AHCT_R47_Cycle1_Medium_High_FP_Only.csv"
+
+def extract_findings(xml_path):
+    findings = []
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for issue in root.findall(".//Issue"):
+            findings.append({
+                "Category": issue.findtext("Category", default="Unknown").strip(),
+                "Abstract": issue.findtext("Abstract", default="").strip(),
+                "Severity": issue.findtext("Severity", default="Unknown").strip(),
+                "FileName": issue.findtext(".//FileName", default="").strip(),
+                "FilePath": issue.findtext(".//FilePath", default="").strip(),
+                "Snippet": issue.findtext(".//Snippet", default="").strip()
+            })
+    except Exception as e:
+        print(f"Error parsing XML: {e}")
+    return findings
+
+# def build_prompt(finding):
+    # return (
+        # "You are a senior security engineer. Classify the following finding as TRUE POSITIVE or FALSE POSITIVE. "
+        # "Focus on reasoning and provide:\n"
+        # "Classification: TRUE POSITIVE or FALSE POSITIVE\n"
+        # "Reasoning: <short justification>\n"
+        # f"Finding:\nCategory: {finding['Category']}\nAbstract: {finding['Abstract']}\n"
+        # f"File: {finding['FileName']}\nPath: {finding['FilePath']}\nSeverity: {finding['Severity']}\n"
+        # f"Code Snippet:\n{finding['Snippet']}\n"
+    )
+
+def build_prompt(finding):
+    return (
+        "You are a senior security engineer reviewing static analysis findings. Your task is to classify each finding as either TRUE POSITIVE (a real vulnerability) or FALSE POSITIVE (safe or irrelevant). "
+        "Use your expertise to identify common false positive patterns such as safe use of variables, known benign libraries, or contextually harmless code. "
+        "Respond ONLY in this format:\n"
+        "Classification: TRUE POSITIVE or FALSE POSITIVE\n"
+        "Reasoning: <short justification based on code context>\n"
+        "----\n"
+        f"Finding:\nCategory: {finding['Category']}\nAbstract: {finding['Abstract']}\n"
+        f"File: {finding['FileName']}\nPath: {finding['FilePath']}\nSeverity: {finding['Severity']}\n"
+        f"Code Snippet:\n{finding['Snippet']}\n"
+    )
+
+
+#########################################################################
+
+
+def query_model(prompt):
+    try:
+        response = requests.post(OLLAMA_API, json={
+            "model": MODEL,
+            "prompt": prompt,
+            "stream": False
+        }, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        return f"Error querying model: {str(e)}"
+
+def parse_field(result, field_name):
+    for line in result.splitlines():
+        if line.startswith(f"{field_name}:"):
+            return line.replace(f"{field_name}:", "").strip()
+    return ""
+
+def main():
+    findings = extract_findings(XML_PATH)
+    total_findings = len(findings)
+    if total_findings == 0:
+        print("No findings found.")
+        return
+
+    with open(CSV_OUTPUT, "w", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Index", "Category", "Abstract", "Severity", "FileName", "FilePath", "Snippet",
+            "Classification", "Reasoning"
+        ])
+
+        for idx, finding in enumerate(findings, 1):
+            print(f"Processing finding {idx}/{total_findings} ({(idx/total_findings)*100:.2f}%)")
+            prompt = build_prompt(finding)
+            result = query_model(prompt)
+            classification = parse_field(result, "Classification")
+            reasoning = parse_field(result, "Reasoning")
+
+            if classification == "FALSE POSITIVE":
+                print(f"\nFinding {idx}: {finding['Category']} | {finding['FileName']}")
+                print(result)
+                print("-" * 80)
+
+                writer.writerow([
+                    idx,
+                    finding["Category"],
+                    finding["Abstract"],
+                    finding["Severity"],
+                    finding["FileName"],
+                    finding["FilePath"],
+                    finding["Snippet"],
+                    classification,
+                    reasoning
+                ])
+
+    print(f"\nFiltered results saved to: {CSV_OUTPUT}")
+
+if __name__ == "__main__":
+    main()
