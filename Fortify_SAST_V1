@@ -7,7 +7,7 @@ XML_PATH = r"C:\Users\Complete report.xml"   ## FORTIFY XML PATH
 OLLAMA_API = "http://localhost:11434/api/generate"
 MODEL = "qwen:14b"  ## LLM MODEL NAME
 API_TIMEOUT = 180
-CSV_OUTPUT = "CS_analysis_results_Complete_Findings.csv"  ## PATH OF OUTPUT.
+CSV_OUTPUT = "test.csv"  ## PATH OF OUTPUT.
 
 def extract_findings(xml_path):
     findings = []
