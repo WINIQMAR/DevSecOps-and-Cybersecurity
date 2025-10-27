@@ -3,11 +3,11 @@ import requests
 import csv
 
 # CONFIGURATION
-XML_PATH = r"C:\Users\nomkumar\Desktop\XML\Edited\REMOVED DATA FOR XML\AHCT_R47_Cycle1_Edited_Medium_High_REMOVED_STATUS_COMMENTS.xml"
+XML_PATH = r"C:\Users\vinay\test.xml"
 OLLAMA_API = "http://localhost:11434/api/generate"
 MODEL = "qwen:14b"
 API_TIMEOUT = 180
-CSV_OUTPUT = "AHCT_R47_Cycle1_Medium_High_FP_Only.csv"
+CSV_OUTPUT = "test.csv"
 
 def extract_findings(xml_path):
     findings = []
